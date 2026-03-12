@@ -237,7 +237,7 @@ export class Blackboard {
       const lines = state.inputs.slice(0, 5).map(i =>
         `[${i.source}] ${i.content.substring(0, 70)}`
       );
-      this.setZone("inputs", `INPUTS (${state.inputs.length})`, lines, ["executive", "all"], 50);
+      this.setZone("inputs", `INPUTS (${state.inputs.length})`, lines, ["executive"], 50);
     }
 
     // ── SKILLS ───────────────────────────────────────────

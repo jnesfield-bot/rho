@@ -37,6 +37,7 @@ const bufferDir = getArg("buffer") ?? "./buffer";
 const batchSize = parseInt(getArg("size") ?? "32");
 const strategy = getArg("strategy") ?? "uniform";
 const episodeFilter = getArg("episode");
+const outputFormat = getArg("format") ?? "full";  // "full" (default) or "weighted"
 // Rainbow hyperparams
 const omega = parseFloat(getArg("omega") ?? "0.6");  // Priority exponent (how much to prioritize)
 const beta = parseFloat(getArg("beta") ?? "0.4");     // IS correction exponent (0=no correction, 1=full)
@@ -105,11 +106,20 @@ function scorePriority(entry, idx, pool, actionCounts) {
   const actionFreq = (actionCounts[actionType] ?? 1) / totalEntries;
   const rarityScore = 1 - actionFreq;  // Rare actions → high novelty
 
-  // If we have value info, use prediction error as novelty
-  // (loaded transitions have metrics.selectedValue)
-  let predictionSurprise = 0.5;  // default: moderate surprise
-  if (entry.success === false) predictionSurprise = 0.8;  // failures are surprising
-  if (entry.success === true && actionFreq > 0.3) predictionSurprise = 0.2;  // common success = boring
+  // Prediction surprise: |selectedValue - outcome| is the TD-error analog.
+  // Load the full transition to get the agent's confidence at decision time.
+  let predictionSurprise = null;
+  const fullTransition = loadTransition(entry.id);
+  if (fullTransition?.metrics?.selectedValue != null) {
+    const outcome = entry.success ? 1.0 : 0.0;
+    predictionSurprise = Math.abs(fullTransition.metrics.selectedValue - outcome);
+  }
+  // Fallback heuristic when transition file is unavailable
+  if (predictionSurprise == null) {
+    predictionSurprise = 0.5;
+    if (entry.success === false) predictionSurprise = 0.8;
+    if (entry.success === true && actionFreq > 0.3) predictionSurprise = 0.2;
+  }
 
   const novelty = 0.6 * rarityScore + 0.4 * predictionSurprise;
 

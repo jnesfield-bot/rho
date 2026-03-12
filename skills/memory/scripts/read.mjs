@@ -29,7 +29,7 @@
  *   node read.mjs --store all --dir /tmp/memory --query "authentication module"
  */
 
-import { readFileSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join } from "path";
 
 const args = process.argv.slice(2);
@@ -52,6 +52,31 @@ function loadJson(storeName, filename) {
   const path = join(dir, storeName, filename);
   if (!existsSync(path)) return null;
   return JSON.parse(readFileSync(path, "utf-8"));
+}
+
+function saveJson(storeName, filename, data) {
+  const path = join(dir, storeName, filename);
+  writeFileSync(path, JSON.stringify(data, null, 2));
+}
+
+/**
+ * Bump accessCount and updatedAt for a set of entity IDs.
+ * Called once per read with only the IDs actually returned to the caller.
+ */
+function bumpSemanticAccess(entityIds) {
+  if (!entityIds.length) return;
+  const entities = loadJson("semantic", "entities.json");
+  if (!entities) return;
+  const now = new Date().toISOString();
+  let changed = false;
+  for (const id of entityIds) {
+    if (entities[id]) {
+      entities[id].accessCount = (entities[id].accessCount ?? 0) + 1;
+      entities[id].updatedAt = now;
+      changed = true;
+    }
+  }
+  if (changed) saveJson("semantic", "entities.json", entities);
 }
 
 const STOPWORDS = new Set([
@@ -85,7 +110,7 @@ function readSemantic() {
     const e = entities[entityId];
     if (e) {
       results.entities.push({ id: entityId, ...e });
-      // Also bump access count (side effect, but useful for decay)
+      bumpSemanticAccess([entityId]);
     }
   }
 
@@ -104,6 +129,9 @@ function readSemantic() {
     }).filter(e => e.relevance > 0).sort((a, b) => b.relevance - a.relevance);
 
     results.entities = scored.slice(0, 10);
+
+    // Bump access counts for returned results only
+    bumpSemanticAccess(results.entities.map(e => e.id));
 
     // Also search relationships
     const rels = loadJson("semantic", "relationships.json") ?? [];

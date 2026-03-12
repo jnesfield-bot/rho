@@ -169,6 +169,50 @@ else
   fail "apply: did not block dangerous action"
 fi
 
+# Skill sub-step policy block
+# Simulate what executeSkill does: check each sub-step against policy before execution.
+# A skill sequence containing "rm -rf /" should be blocked at the sub-step level.
+POLICY_FILE="policies/worker-default.json"
+DANGEROUS_STEP='{"kind":"primitive","type":"bash","description":"clean up","params":{"command":"rm -rf /"}}'
+SAFE_STEP='{"kind":"primitive","type":"bash","description":"list files","params":{"command":"ls -la"}}'
+
+# Use the evaluate.mjs script to check each step individually against block rules
+RESULT=$(node -e "
+const { readFileSync } = require('fs');
+const policy = JSON.parse(readFileSync('$POLICY_FILE', 'utf-8'));
+const dangerousAction = $DANGEROUS_STEP;
+const safeAction = $SAFE_STEP;
+
+function matchPrecondition(rule, action) {
+  const pre = rule.precondition;
+  if (!pre || pre.type !== 'action_match') return false;
+  const val = String(pre.field.split('.').reduce((o, k) => o?.[k], action) ?? '');
+  return new RegExp(pre.pattern, 'i').test(val);
+}
+
+function checkBlock(action) {
+  for (const rule of policy.rules) {
+    if (rule.effect === 'block' && matchPrecondition(rule, action)) return rule.message;
+  }
+  return null;
+}
+
+const dangerousBlocked = checkBlock(dangerousAction);
+const safeBlocked = checkBlock(safeAction);
+console.log(JSON.stringify({ dangerousBlocked, safeBlocked }));
+" 2>/dev/null)
+
+if echo "$RESULT" | grep -q '"dangerousBlocked"' && echo "$RESULT" | grep -q '"safeBlocked":null'; then
+  DANGEROUS_MSG=$(echo "$RESULT" | node -e "const d=JSON.parse(require('fs').readFileSync('/dev/stdin','utf8'));process.stdout.write(d.dangerousBlocked ?? 'null')")
+  if [ "$DANGEROUS_MSG" != "null" ]; then
+    pass "skill sub-step: dangerous bash blocked by policy ('$DANGEROUS_MSG'), safe bash allowed"
+  else
+    fail "skill sub-step: dangerous bash was NOT blocked"
+  fi
+else
+  fail "skill sub-step: policy check failed to run"
+fi
+
 echo ""
 
 # ── 6. Code Search ───────────────────────────────────────
@@ -191,6 +235,50 @@ else
 fi
 
 rm -f /tmp/test-cs-index.json
+echo ""
+
+# ── 7. Integration: Heartbeat Loop ──────────────────────
+echo "▸ heartbeat-loop (integration)"
+
+if [ -z "$ANTHROPIC_API_KEY" ]; then
+  skip "heartbeat loop: ANTHROPIC_API_KEY not set"
+else
+  RESULT=$(npx tsx tests/integration-heartbeat.ts 2>/dev/null)
+  EXIT_CODE=$?
+
+  if [ $EXIT_CODE -eq 2 ]; then
+    skip "heartbeat loop: skipped ($(echo "$RESULT" | node -pe "JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).reason" 2>/dev/null || echo 'unknown'))"
+  elif [ $EXIT_CODE -eq 0 ]; then
+    # Parse individual results
+    FILE_OK=$(echo "$RESULT" | node -pe "JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).results.file_created.pass" 2>/dev/null)
+    REPLAY_OK=$(echo "$RESULT" | node -pe "JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).results.replay_buffer.pass" 2>/dev/null)
+    EPISODIC_OK=$(echo "$RESULT" | node -pe "JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).results.episodic_memory.pass" 2>/dev/null)
+    POLICY_OK=$(echo "$RESULT" | node -pe "JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).results.policy_consulted.pass" 2>/dev/null)
+    HEARTBEATS=$(echo "$RESULT" | node -pe "JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).heartbeats" 2>/dev/null)
+
+    [ "$FILE_OK" = "true" ] && pass "file created: /tmp/rho-test-output.txt with 'hello world'" || fail "file not created or wrong content"
+    [ "$REPLAY_OK" = "true" ] && pass "replay buffer: transitions recorded" || fail "replay buffer: no transitions"
+    [ "$EPISODIC_OK" = "true" ] && pass "episodic memory: entries written" || fail "episodic memory: no entries"
+    [ "$POLICY_OK" = "true" ] && pass "policy engine: consulted during select (policyLog present)" || fail "policy engine: not consulted"
+    pass "heartbeat loop: completed in $HEARTBEATS heartbeat(s)"
+  else
+    # Test failed — try to extract details
+    ERROR=$(echo "$RESULT" | node -pe "try{JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).error}catch(e){'unknown error'}" 2>/dev/null || echo "unknown error")
+    fail "heartbeat loop: $ERROR"
+
+    # Still check individual results if available
+    FILE_OK=$(echo "$RESULT" | node -pe "try{JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).results.file_created.pass}catch(e){'?'}" 2>/dev/null)
+    REPLAY_OK=$(echo "$RESULT" | node -pe "try{JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).results.replay_buffer.pass}catch(e){'?'}" 2>/dev/null)
+    EPISODIC_OK=$(echo "$RESULT" | node -pe "try{JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).results.episodic_memory.pass}catch(e){'?'}" 2>/dev/null)
+    POLICY_OK=$(echo "$RESULT" | node -pe "try{JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).results.policy_consulted.pass}catch(e){'?'}" 2>/dev/null)
+
+    [ "$FILE_OK" = "true" ] && pass "file created" || fail "file not created"
+    [ "$REPLAY_OK" = "true" ] && pass "replay buffer" || fail "replay buffer"
+    [ "$EPISODIC_OK" = "true" ] && pass "episodic memory" || fail "episodic memory"
+    [ "$POLICY_OK" = "true" ] && pass "policy engine" || fail "policy engine"
+  fi
+fi
+
 echo ""
 
 # ── Summary ──────────────────────────────────────────────

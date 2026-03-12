@@ -95,6 +95,13 @@ export interface SingleAgentConfig extends AgentLoopConfig {
   policyPath?: string;
   /** Directory for tri-store memory (episodic/semantic/procedural) */
   memoryDir?: string;
+  /**
+   * How often (in heartbeats) to run memory maintenance.
+   * Compact runs every `maintenanceInterval` heartbeats.
+   * Reflect runs every `maintenanceInterval * 2` heartbeats.
+   * Default: 25.
+   */
+  maintenanceInterval?: number;
 }
 
 // ── Implementation ───────────────────────────────────────
@@ -117,6 +124,7 @@ export class SingleAgent extends AgentLoop {
   private lastBoardText: string = "";
   private policy: any = null;  // Loaded from policy JSON
   private memoryDir: string;   // Tri-store memory directory
+  private maintenanceInterval: number;  // Heartbeats between maintenance runs
   private loopContext: LoopContext = {
     heartbeat: 0,
     consecutiveFailures: 0,
@@ -135,6 +143,7 @@ export class SingleAgent extends AgentLoop {
     this.episodeId = config.episodeId ?? `ep-${Date.now().toString(36)}`;
     this.board = new Blackboard(config.lens ?? "worker");
     this.memoryDir = config.memoryDir ?? join(config.workDir, "tri-memory");
+    this.maintenanceInterval = config.maintenanceInterval ?? 25;
   }
 
   // ── Setup / Teardown ─────────────────────────────────────
@@ -267,6 +276,9 @@ export class SingleAgent extends AgentLoop {
     // Always update loop context and tri-memory (even without replay buffer)
     this.updateLoopContext(selected, result);
     this.writeTriMemory(selected, result);
+
+    // Periodic memory maintenance (compact every N heartbeats, reflect every 2N)
+    await this.maybeRunMaintenance();
 
     if (!this.replayBufferDir || !this.replayIndex) return;
 
@@ -845,6 +857,22 @@ export class SingleAgent extends AgentLoop {
   }
 
   /**
+   * Check if a single action would be blocked by policy rules.
+   * Returns the block message if blocked, null if allowed.
+   * Used by executeSkill() to enforce safety on sub-steps.
+   */
+  private checkPolicyBlock(action: PrimitiveAction): string | null {
+    if (!this.policy?.rules) return null;
+    const rules = [...this.policy.rules].sort((a: any, b: any) => (b.priority ?? 0) - (a.priority ?? 0));
+    for (const rule of rules) {
+      if (rule.effect === "block" && this.matchPrecondition(rule, this.lastState, action)) {
+        return rule.message ?? `Blocked by rule: ${rule.id}`;
+      }
+    }
+    return null;
+  }
+
+  /**
    * Check a single policy rule's precondition against current state and action.
    */
   private matchPrecondition(rule: any, state: State | null, action: Action | null): boolean {
@@ -1074,6 +1102,29 @@ export class SingleAgent extends AgentLoop {
           description: step.description,
           timestamp: Date.now(),
         });
+
+        // Policy check: ensure sub-step isn't blocked by safety rules
+        const policyBlock = this.checkPolicyBlock(step.action);
+        if (policyBlock) {
+          const blockedResult: ActionResult = {
+            action: step.action, success: false, output: "",
+            error: `Policy violation: ${policyBlock}`,
+            artifacts: [], durationMs: 0, timestamp: Date.now(),
+          };
+          step.result = blockedResult;
+
+          this.emit({
+            type: "skill_step_end",
+            skill: skill.name, step: i, success: false, timestamp: Date.now(),
+          });
+
+          execution.output += `\n--- Step ${i + 1}: ${step.description} ---\n`;
+          execution.output += `BLOCKED: ${policyBlock}`;
+
+          const shouldContinue = await this.shouldContinueSkill(execution, blockedResult);
+          if (!shouldContinue) { execution.failed = true; break; }
+          continue;
+        }
 
         // Execute the primitive action for this step
         const stepResult = await this.executePrimitive(step.action);
@@ -1493,7 +1544,246 @@ Respond with ONLY "continue" or "abort".`;
       this.saveTriJson("procedural", "rules.json", rules);
     }
 
+    // Semantic: lightweight entity extraction from successful bash/read output
+    if (result.success && result.output && (actionType === "bash" || actionType === "read")) {
+      this.extractSemanticEntities(result.output);
+    }
+
     this.emit({ type: "memory_write", store: "episodic", key: `hb${this.heartbeatCount}`, timestamp: Date.now() });
+  }
+
+  /**
+   * Extract file paths, symbol names, and error patterns from action output
+   * and upsert them as semantic entities. Fast regex scan, no NLP.
+   */
+  private extractSemanticEntities(output: string): void {
+    const hits: Array<[string, string]> = []; // [id, type]
+    const snippet = output.substring(0, 4000);
+    for (const m of snippet.matchAll(/(?:^|[\s"'`])((\.\/|\/)?[\w.-]+(?:\/[\w.-]+)+\.\w{1,5})/gm)) hits.push([m[1], "file"]);
+    for (const m of snippet.matchAll(/(?:class|function|export\s+(?:const|function|class))\s+([A-Za-z_]\w{2,})/g)) hits.push([m[1], "symbol"]);
+    for (const m of snippet.matchAll(/(?:Error|FAIL|ENOENT|EACCES|Cannot find|Module not found)[:\s]+(.{10,60})/gi)) hits.push([m[1].trim().substring(0, 60), "error-pattern"]);
+    if (hits.length === 0) return;
+    const entities = this.loadTriJson("semantic", "entities.json") ?? {};
+    const now = new Date().toISOString();
+    const seen = new Set<string>();
+    for (const [raw, type] of hits) {
+      const id = raw.replace(/[^a-zA-Z0-9_./-]/g, "").substring(0, 80);
+      if (!id || id.length < 3 || seen.has(id)) continue;
+      seen.add(id);
+      if (entities[id]) { entities[id].accessCount = (entities[id].accessCount ?? 0) + 1; entities[id].updatedAt = now; }
+      else { entities[id] = { type, facts: [], confidence: 0.5, source: "extraction", accessCount: 1, createdAt: now, updatedAt: now }; }
+    }
+    this.saveTriJson("semantic", "entities.json", entities);
+  }
+
+  // ── Memory Maintenance (compact + reflect) ────────────
+
+  /**
+   * Budgets for each memory store.
+   * Matching the defaults in manage.mjs.
+   */
+  private static readonly EPISODIC_BUDGET = 1000;
+  private static readonly SEMANTIC_BUDGET = 500;
+  private static readonly PROCEDURAL_BUDGET = 200;
+
+  /**
+   * Run lightweight memory maintenance on schedule.
+   * - Every `maintenanceInterval` heartbeats: compact (enforce budgets)
+   * - Every `maintenanceInterval * 2` heartbeats: reflect (promote patterns)
+   *
+   * Checks store sizes before doing any work — if under budget, skips entirely.
+   */
+  private async maybeRunMaintenance(): Promise<void> {
+    const interval = this.maintenanceInterval;
+    if (interval <= 0 || this.heartbeatCount === 0) return;
+
+    const shouldCompact = this.heartbeatCount % interval === 0;
+    const shouldReflect = this.heartbeatCount % (interval * 2) === 0;
+
+    if (!shouldCompact && !shouldReflect) return;
+
+    // Quick check: is any store over budget?
+    const episodicIndex = this.loadTriJson("episodic", "episode-index.json") ?? [];
+    const entities = this.loadTriJson("semantic", "entities.json") ?? {};
+    const rules = this.loadTriJson("procedural", "rules.json") ?? {};
+
+    const episodicCount = episodicIndex.length;
+    const semanticCount = Object.keys(entities).length;
+    const proceduralCount = Object.keys(rules).length;
+
+    const overBudget =
+      episodicCount > SingleAgent.EPISODIC_BUDGET ||
+      semanticCount > SingleAgent.SEMANTIC_BUDGET ||
+      proceduralCount > SingleAgent.PROCEDURAL_BUDGET;
+
+    if (shouldCompact && overBudget) {
+      this.runCompact(episodicIndex, entities, rules);
+    }
+
+    if (shouldReflect && episodicCount >= 3) {
+      this.runReflect(episodicIndex);
+    }
+  }
+
+  /**
+   * Compact: enforce budgets across all stores.
+   * Equivalent to manage.mjs --operation compact, run in-process.
+   */
+  private runCompact(
+    episodicIndex: any[],
+    entities: Record<string, any>,
+    rules: Record<string, any>,
+  ): void {
+    let compacted = 0;
+
+    // Episodic: trim oldest entries
+    if (episodicIndex.length > SingleAgent.EPISODIC_BUDGET) {
+      const trimCount = episodicIndex.length - SingleAgent.EPISODIC_BUDGET;
+      episodicIndex.splice(0, trimCount);
+      this.saveTriJson("episodic", "episode-index.json", episodicIndex);
+      compacted += trimCount;
+    }
+
+    // Semantic: keep top entities by (confidence * accessCount)
+    if (Object.keys(entities).length > SingleAgent.SEMANTIC_BUDGET) {
+      const sorted = Object.entries(entities)
+        .map(([id, e]) => ({ id, e, score: (e.confidence ?? 0.5) * (1 + (e.accessCount ?? 0)) }))
+        .sort((a, b) => b.score - a.score);
+
+      const kept: Record<string, any> = {};
+      for (let i = 0; i < SingleAgent.SEMANTIC_BUDGET && i < sorted.length; i++) {
+        kept[sorted[i].id] = sorted[i].e;
+      }
+      compacted += Object.keys(entities).length - Object.keys(kept).length;
+      this.saveTriJson("semantic", "entities.json", kept);
+    }
+
+    // Procedural: keep static rules + top learned rules by confidence
+    if (Object.keys(rules).length > SingleAgent.PROCEDURAL_BUDGET) {
+      const staticRules: Record<string, any> = {};
+      const learnedRules: Array<[string, any]> = [];
+
+      for (const [id, r] of Object.entries(rules)) {
+        if (r.source === "policy" || r.source === "static") {
+          staticRules[id] = r;
+        } else {
+          learnedRules.push([id, r]);
+        }
+      }
+
+      learnedRules.sort((a, b) => (b[1].confidence ?? 0) - (a[1].confidence ?? 0));
+      const remaining = SingleAgent.PROCEDURAL_BUDGET - Object.keys(staticRules).length;
+      const kept: Record<string, any> = { ...staticRules };
+      for (let i = 0; i < remaining && i < learnedRules.length; i++) {
+        kept[learnedRules[i][0]] = learnedRules[i][1];
+      }
+      compacted += Object.keys(rules).length - Object.keys(kept).length;
+      this.saveTriJson("procedural", "rules.json", kept);
+    }
+
+    if (compacted > 0) {
+      this.emit({ type: "memory_write", store: "compact", key: `compacted-${compacted}`, timestamp: Date.now() });
+    }
+  }
+
+  /**
+   * Reflect: promote episodic patterns to procedural rules and semantic entities.
+   * Equivalent to manage.mjs --operation reflect, run in-process.
+   */
+  private runReflect(episodicIndex: any[]): void {
+    let reflected = 0;
+
+    // Pattern detection: find repeated action types with consistent outcomes
+    const actionStats: Record<string, { success: number; fail: number; total: number }> = {};
+    for (const e of episodicIndex) {
+      const key = e.actionType ?? "unknown";
+      if (!actionStats[key]) actionStats[key] = { success: 0, fail: 0, total: 0 };
+      actionStats[key].total++;
+      if (e.success) actionStats[key].success++;
+      else actionStats[key].fail++;
+    }
+
+    // Generate procedural rules from patterns
+    const rules = this.loadTriJson("procedural", "rules.json") ?? {};
+    for (const [action, stats] of Object.entries(actionStats)) {
+      if (stats.total < 3) continue;
+
+      const successRate = stats.success / stats.total;
+
+      if (successRate < 0.3 && stats.fail >= 3) {
+        const ruleId = `caution-${action}`;
+        if (!rules[ruleId]) {
+          rules[ruleId] = {
+            description: `Caution: ${action} has a ${Math.round(successRate * 100)}% success rate (${stats.fail} failures)`,
+            confidence: 1 - successRate,
+            source: "reflection",
+            successes: stats.success,
+            failures: stats.fail,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            usageCount: 0,
+          };
+          reflected++;
+        }
+      }
+
+      if (successRate > 0.8 && stats.success >= 5) {
+        const ruleId = `reliable-${action}`;
+        if (!rules[ruleId]) {
+          rules[ruleId] = {
+            description: `Reliable: ${action} succeeds ${Math.round(successRate * 100)}% of the time (${stats.success} successes)`,
+            confidence: successRate,
+            source: "reflection",
+            successes: stats.success,
+            failures: stats.fail,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            usageCount: 0,
+          };
+          reflected++;
+        }
+      }
+    }
+
+    if (reflected > 0) {
+      this.saveTriJson("procedural", "rules.json", rules);
+    }
+
+    // Extract frequently mentioned terms as semantic entities
+    const allText = episodicIndex.map(e => e.taskSnippet ?? "").join(" ");
+    const tokens = allText.toLowerCase().split(/\W+/).filter(t => t.length > 3);
+    const freq: Record<string, number> = {};
+    for (const t of tokens) freq[t] = (freq[t] ?? 0) + 1;
+
+    const entities = this.loadTriJson("semantic", "entities.json") ?? {};
+    const topTerms = Object.entries(freq)
+      .filter(([, count]) => count >= 3)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10);
+
+    let newEntities = 0;
+    for (const [term, count] of topTerms) {
+      if (!entities[term]) {
+        entities[term] = {
+          type: "concept",
+          facts: [`Mentioned ${count} times in episodic memory`],
+          confidence: Math.min(1, count / 10),
+          source: "reflection",
+          accessCount: 0,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+        newEntities++;
+      }
+    }
+
+    if (newEntities > 0) {
+      this.saveTriJson("semantic", "entities.json", entities);
+    }
+
+    if (reflected + newEntities > 0) {
+      this.emit({ type: "memory_write", store: "reflect", key: `reflected-${reflected}-entities-${newEntities}`, timestamp: Date.now() });
+    }
   }
 
   /**
