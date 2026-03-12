@@ -15,6 +15,7 @@ import type {
   LoopEvent,
   LoopEventListener,
   ScoredAction,
+  SkillExecution,
   State,
 } from "./types.js";
 
@@ -25,6 +26,7 @@ export abstract class AgentLoop {
   protected aborted = false;
   protected lastState: State | null = null;
   protected lastResult: ActionResult | null = null;
+  protected activeSkill: SkillExecution | null = null;
   private listeners: LoopEventListener[] = [];
 
   constructor(config: AgentLoopConfig) {

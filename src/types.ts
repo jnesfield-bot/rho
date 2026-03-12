@@ -1,8 +1,13 @@
 /**
  * Core types for the Agent Loop system.
- * 
+ *
  * The loop follows an RL-inspired heartbeat:
  *   Observe → Evaluate → Select → Act → (repeat)
+ *
+ * Actions come in two forms:
+ *   - Primitive: a single atomic step (one bash command, one file read)
+ *   - Skill: a temporally extended sequence that runs to completion
+ *     (the "options" framework from Sutton, Precup & Singh 1999)
  */
 
 /** Unique identifier for an agent instance */
@@ -10,6 +15,103 @@ export type AgentId = string;
 
 /** Unique identifier for a task */
 export type TaskId = string;
+
+// ── Skills ───────────────────────────────────────────────
+
+/** A discovered skill the agent can invoke */
+export interface SkillDescriptor {
+  /** Skill name (matches directory name) */
+  name: string;
+  /** What this skill does — drives evaluate scoring */
+  description: string;
+  /** Path to the SKILL.md file */
+  skillPath: string;
+  /** Base directory containing the skill's scripts/assets */
+  baseDir: string;
+  /** Full instructions (loaded on demand) */
+  instructions?: string;
+}
+
+/** A single step within a skill execution sequence */
+export interface SkillStep {
+  /** Step index (0-based) */
+  index: number;
+  /** What this step does */
+  description: string;
+  /** The primitive action to execute */
+  action: PrimitiveAction;
+  /** Output from execution */
+  result?: ActionResult;
+}
+
+/** Status of a skill that's currently executing */
+export interface SkillExecution {
+  /** Which skill is running */
+  skill: SkillDescriptor;
+  /** The goal/intent for this invocation */
+  goal: string;
+  /** Planned steps (may grow as execution reveals more work) */
+  steps: SkillStep[];
+  /** Index of the current step being executed */
+  currentStep: number;
+  /** Whether the skill sequence is complete */
+  complete: boolean;
+  /** Whether the skill sequence failed */
+  failed: boolean;
+  /** Accumulated output from all steps */
+  output: string;
+  /** Files created/modified during execution */
+  artifacts: string[];
+}
+
+// ── Actions ──────────────────────────────────────────────
+
+/** A primitive (atomic) action — one step, one heartbeat */
+export interface PrimitiveAction {
+  kind: "primitive";
+  type: string;
+  description: string;
+  params: Record<string, unknown>;
+}
+
+/** A skill action — a coherent sequence that may span multiple sub-steps */
+export interface SkillAction {
+  kind: "skill";
+  type: "skill";
+  /** Which skill to invoke */
+  skillName: string;
+  /** The goal for this skill invocation */
+  goal: string;
+  description: string;
+  params: Record<string, unknown>;
+}
+
+/** An action is either primitive or a skill invocation */
+export type Action = PrimitiveAction | SkillAction;
+
+/** A candidate action with an estimated value */
+export interface ScoredAction {
+  action: Action;
+  /** Estimated value/utility of taking this action (higher = better) */
+  value: number;
+  /** LLM's reasoning for this score */
+  reasoning: string;
+}
+
+/** Result of executing an action (primitive or full skill) */
+export interface ActionResult {
+  action: Action;
+  success: boolean;
+  output: string;
+  artifacts: string[];
+  error?: string;
+  durationMs: number;
+  timestamp: number;
+  /** If this was a skill, the full execution trace */
+  skillTrace?: SkillExecution;
+}
+
+// ── State ────────────────────────────────────────────────
 
 /** The observed state of the world at a given heartbeat */
 export interface State {
@@ -27,6 +129,10 @@ export interface State {
   inputs: Input[];
   /** Results from the last action taken */
   lastActionResult: ActionResult | null;
+  /** Available skills the agent can invoke */
+  availableSkills: SkillDescriptor[];
+  /** Currently executing skill (if mid-sequence) */
+  activeSkill: SkillExecution | null;
   /** Arbitrary key-value observations (extensible) */
   observations: Record<string, unknown>;
 }
@@ -53,8 +159,8 @@ export interface ChildStatus {
   agentId: AgentId;
   taskId: TaskId;
   status: "idle" | "running" | "done" | "failed" | "blocked";
-  progress: number; // 0.0 - 1.0
-  artifacts: string[]; // file paths or identifiers
+  progress: number;
+  artifacts: string[];
   blockers: string[];
   heartbeatCount: number;
   lastUpdate: number;
@@ -62,40 +168,13 @@ export interface ChildStatus {
 
 /** An input event to be processed */
 export interface Input {
-  source: string; // "slack", "api", "event", "child_report", etc.
+  source: string;
   content: string;
   metadata: Record<string, unknown>;
   timestamp: number;
 }
 
-/** A candidate action with an estimated value */
-export interface ScoredAction {
-  action: Action;
-  /** Estimated value/utility of taking this action (higher = better) */
-  value: number;
-  /** LLM's reasoning for this score */
-  reasoning: string;
-}
-
-/** An action the agent can take */
-export interface Action {
-  type: string;
-  /** Human-readable description of what this action does */
-  description: string;
-  /** Parameters for the action */
-  params: Record<string, unknown>;
-}
-
-/** Result of executing an action */
-export interface ActionResult {
-  action: Action;
-  success: boolean;
-  output: string;
-  artifacts: string[]; // files created/modified
-  error?: string;
-  durationMs: number;
-  timestamp: number;
-}
+// ── Config ───────────────────────────────────────────────
 
 /** Configuration for an agent loop */
 export interface AgentLoopConfig {
@@ -109,7 +188,11 @@ export interface AgentLoopConfig {
   maxHeartbeats: number;
   /** Whether to persist state between runs */
   persistState: boolean;
+  /** Directories to scan for skills */
+  skillDirs?: string[];
 }
+
+// ── Events ───────────────────────────────────────────────
 
 /** Events emitted by the agent loop for observability */
 export type LoopEvent =
@@ -118,6 +201,9 @@ export type LoopEvent =
   | { type: "evaluate_complete"; scoredActions: ScoredAction[]; timestamp: number }
   | { type: "select_complete"; selected: Action; timestamp: number }
   | { type: "act_complete"; result: ActionResult; timestamp: number }
+  | { type: "skill_step_start"; skill: string; step: number; description: string; timestamp: number }
+  | { type: "skill_step_end"; skill: string; step: number; success: boolean; timestamp: number }
+  | { type: "skill_complete"; skill: string; success: boolean; steps: number; timestamp: number }
   | { type: "heartbeat_end"; heartbeat: number; timestamp: number }
   | { type: "loop_paused"; reason: string; timestamp: number }
   | { type: "loop_error"; error: string; heartbeat: number; timestamp: number };
