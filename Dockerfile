@@ -16,6 +16,7 @@ COPY skills/ ./skills/
 COPY sequences/ ./sequences/
 COPY policies/ ./policies/
 COPY tests/ ./tests/
+COPY .pi/ ./.pi/
 COPY test-all.sh ./
 
 RUN mkdir -p /workspace /buffer
