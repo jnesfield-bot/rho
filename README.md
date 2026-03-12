@@ -246,6 +246,82 @@ Rho was built iteratively across 20 commits, each adding a layer of cognitive ca
 | **v0.8** — Code Search | Multi-stream semantic search across repos (RepoRift-inspired) | `grep` is not enough — you need name/docstring/body/component matching |
 | **v0.9** — Tri-Store Memory | Episodic, semantic, procedural stores with write/read/manage | Memory is the learning mechanism when you can't do gradient updates |
 | **v1.0** — Rainbow Priority | Novelty × usefulness scoring, multi-step chaining, outcome distributions | Not all experiences are equally useful — prioritize by learning potential |
+| **v1.1** — Self-Repair | Blackboard visibility fix, semantic `accessCount` tracking on read, real TD-error priority scoring from transition files | The architecture had gaps between design intent and implementation — the agent identified and patched them |
+| **v1.2** — Automatic Maintenance | `maintenanceInterval` config, in-process compact/reflect every N heartbeats, budget enforcement | Memory management can't be manual — it must run on schedule as part of the heartbeat lifecycle |
+| **v1.3** — Semantic Extraction | Lightweight regex extraction of file paths, symbols, and error patterns from bash/read output into semantic entities | Semantic memory was a dead store — now every successful action deposits knowledge automatically |
+| **v1.4** — Skill Safety | `checkPolicyBlock()` enforces safety rules on skill sub-steps before execution | Skills bypassed the policy engine entirely — a skill plan could include `rm -rf /` unchecked |
+| **v1.5** — Integration Test | Full heartbeat loop test: file creation, replay buffer, episodic memory, policy consultation verified end-to-end | Testing parts in isolation doesn't prove the assembly works — you need one test that runs the whole loop |
+| **v1.6** — Research-Driven Roadmap | arXiv literature review → prioritized improvement list drawn from 5 papers | The agent can use its own arXiv skill to identify architectural improvements from current research |
+
+---
+
+## Self-Evolution: An Experiment in Research-Driven Self-Improvement
+
+Rho's v1.1–v1.6 changes were produced in a single session where the agent was pointed at its own codebase and asked to review, fix, and improve itself. The process demonstrates a concrete **self-evolution loop**:
+
+```
+  ┌─────────────────────────────────────────────────────────┐
+  │                SELF-EVOLUTION LOOP                       │
+  │                                                         │
+  │  1. REVIEW — Read own source, tests, paper, git history │
+  │       ↓                                                 │
+  │  2. IDENTIFY — Find gaps between design intent and      │
+  │     implementation (e.g., "accessCount never bumped",   │
+  │     "skills bypass policy", "semantic store never       │
+  │     written to")                                        │
+  │       ↓                                                 │
+  │  3. FIX — Surgical edits with verification tests        │
+  │       ↓                                                 │
+  │  4. RESEARCH — Use arXiv skill to find relevant papers  │
+  │     on hallucination, long-horizon agents, memory       │
+  │       ↓                                                 │
+  │  5. PLAN — Map paper findings to concrete code changes  │
+  │       ↓                                                 │
+  │  6. COMMIT — Push changes, update documentation         │
+  │       └──────────────→ (repeat)                         │
+  └─────────────────────────────────────────────────────────┘
+```
+
+### What Happened
+
+With minimal human guidance ("review yourself", "fix this gap", "look up papers and propose improvements"), the agent:
+
+1. **Found and fixed 6 implementation bugs/gaps** — visibility tags, missing side effects, bypassed safety checks, dead code paths, missing maintenance triggers
+2. **Searched arXiv** for 5 papers across hallucination detection and agent long-task management
+3. **Produced a prioritized 10-item roadmap** mapping paper findings to specific code changes
+
+### The 5 Papers Reviewed
+
+| Paper | Key Finding for Rho |
+|-------|-------------------|
+| **A Survey of Hallucination in Large Foundation Models** (2309.05922) | Self-consistency checks and knowledge grounding reduce hallucinated actions — Rho should validate evaluate() outputs against known workspace state |
+| **ToolBeHonest** (2406.20015) | Tool-using LLMs fail most at *solvability detection* — Rho should pre-check task feasibility before burning heartbeats |
+| **Agent Planning with World Knowledge Model** (2405.14205) | Global prior knowledge + dynamic state deltas prevent blind trial-and-error — Rho's blackboard should show *what changed*, not just *what exists* |
+| **Task Memory Engine (TME)** (2504.08525) | Hierarchical task trees with per-node state enable richer queries than flat episode lists — Rho's episodic memory should be tree-structured |
+| **Memory in the Age of AI Agents** (2512.13564) | LLM-guided memory consolidation outperforms frequency counting — Rho's reflect should use the LLM, not just regex/stats |
+
+### Resulting Improvement Roadmap (Priority Order)
+
+1. **Validate skill names in parseEvaluateResponse()** — reject hallucinated skill references (from ToolBeHonest)
+2. **Add DELTA zone to blackboard** — show what changed since last heartbeat (from WKM)
+3. **Solvability pre-check** — one LLM call before the loop to catch impossible tasks (from ToolBeHonest)
+4. **Ground evaluate prompt with semantic entities** — inject known facts as hallucination anchors (from Hallucination Survey)
+5. **LLM-guided memory consolidation** — replace frequency-counting reflect with actual LLM summarization (from Memory Survey)
+6. **Reward-weighted reflection** — weight episodic→procedural promotion by outcome success (from Memory Survey)
+7. **Hierarchical task memory tree** — replace flat episodic index with parent-linked tree nodes (from TME)
+8. **Multi-sample evaluation** — call evaluate() multiple times on uncertain heartbeats, intersect results (from Hallucination Survey)
+9. **Cheap world model for outcome prediction** — use a small/fast model to predict action outcomes before committing (from WKM)
+10. **Plan caching / step deduplication** — reuse successful skill steps across sessions (from TME + Memory Survey)
+
+### Why This Matters
+
+This is not hypothetical. The agent literally:
+- Used `skills/arxiv-research/scripts/search.mjs` to query arXiv
+- Analyzed abstracts and selected papers by relevance to its own architecture
+- Cross-referenced paper findings against its own source code
+- Produced actionable code-level recommendations
+
+**The arXiv skill exists so Rho can research improvements to itself.** The self-evolution loop is the intended use case — an agent that reads papers, identifies applicable techniques, and implements them, with a human providing direction and review.
 
 ---
 
@@ -285,15 +361,29 @@ Rho draws on three research traditions:
 - **CoALA** (2309.02427) — Cognitive architectures for language agents
 - **Glyph** (2510.17800) — Information-dense rendering, spatial layout optimization
 
+### Hallucination & Reliability
+- **Hallucination Survey** (2309.05922) — Taxonomy of hallucination types, self-consistency mitigation
+- **ToolBeHonest** (2406.20015) — Multi-level hallucination benchmark for tool-augmented LLMs
+
+### Agent Memory & Long-Horizon Planning
+- **WKM** (2405.14205) — World Knowledge Models providing global prior + dynamic state knowledge
+- **TME** (2504.08525) — Hierarchical Task Memory Trees for multi-step state tracking
+- **Memory in the Age of AI Agents** (2512.13564) — Comprehensive survey: forms, functions, dynamics of agent memory
+
 Additional references: Memory Survey (2404.13501), MACLA (2512.18950), MemGPT (2310.08560), RepoRift (2408.11058), Latent Context Compilation (2602.21221), C3 (2511.15244), IC-Former (2406.13618), LLM-MAS (2412.17481).
 
 ---
 
 ## Future Work
 
-- **Executive Agent** — Hierarchical delegation with policy injection into workers
-- **LLM-guided Reflection** — Higher-quality episodic → semantic → procedural promotion
-- **Learned Priority Weights** — Replace hand-tuned novelty/usefulness coefficients
+See the [research-driven roadmap](#resulting-improvement-roadmap-priority-order) above for the full prioritized list. Key themes:
+
+- **Hallucination resistance** — Solvability pre-checks, semantic grounding in evaluate prompts, multi-sample consistency (from 2309.05922, 2406.20015)
+- **Richer observation** — Blackboard DELTA zones showing what changed, not just what exists (from 2405.14205)
+- **Structured task memory** — Hierarchical tree replacing flat episodic index, with per-node state tracking (from 2504.08525)
+- **LLM-guided memory management** — Replace frequency-counting reflection with actual LLM consolidation (from 2512.13564)
+- **Executive Agent** — Hierarchical delegation with policy injection into workers, shared/private memory partitions
+- **World model** — Cheap model predicting action outcomes before committing (from 2405.14205)
 - **Benchmark Evaluation** — SWE-bench, WebArena
 - **Distillation Pipeline** — Worker execution traces → smaller/cheaper models for well-understood tasks
 
