@@ -19,11 +19,6 @@ RUN mkdir -p /workspace /buffer
 
 ENV REPLAY_BUFFER_DIR=/buffer
 
-# Interactive pi session with agent-loop extension loaded.
-# This opens the same TUI you get when running pi normally,
-# but with /loop, /loop-status, /loop-stop, /loop-memory commands
-# and the heartbeat tool available.
-#
-# Override for headless mode:
-#   docker run ... agent-loop npx tsx src/main.ts /workspace
-ENTRYPOINT ["pi", "--dir", "/workspace", "-e", "/app/src/extension.ts"]
+# ----- Entrypoint ------------------------------------------------------------
+ENTRYPOINT ["pi"]
+CMD []
