@@ -252,12 +252,13 @@ Rho was built iteratively across 20 commits, each adding a layer of cognitive ca
 | **v1.4** — Skill Safety | `checkPolicyBlock()` enforces safety rules on skill sub-steps before execution | Skills bypassed the policy engine entirely — a skill plan could include `rm -rf /` unchecked |
 | **v1.5** — Integration Test | Full heartbeat loop test: file creation, replay buffer, episodic memory, policy consultation verified end-to-end | Testing parts in isolation doesn't prove the assembly works — you need one test that runs the whole loop |
 | **v1.6** — Research-Driven Roadmap | arXiv literature review → prioritized improvement list drawn from 5 papers | The agent can use its own arXiv skill to identify architectural improvements from current research |
+| **v1.7** — Policy & Event Fixes | Fixed 2 dead policy rules (`condition` → `precondition`), double `select_complete` emit, 5 missing event handlers, incomplete public exports | Dead rules are silent failures — integration tests pass but safety rules never fire. Always verify the runtime path matches the schema. |
 
 ---
 
 ## Self-Evolution: An Experiment in Research-Driven Self-Improvement
 
-Rho's v1.1–v1.6 changes were produced in a single session where the agent was pointed at its own codebase and asked to review, fix, and improve itself. The process demonstrates a concrete **self-evolution loop**:
+Rho's v1.1–v1.7 changes were produced in sessions where the agent was pointed at its own codebase and asked to review, fix, and improve itself. The process demonstrates a concrete **self-evolution loop**:
 
 ```
   ┌─────────────────────────────────────────────────────────┐
@@ -286,9 +287,10 @@ Rho's v1.1–v1.6 changes were produced in a single session where the agent was 
 
 With minimal human guidance ("review yourself", "fix this gap", "look up papers and propose improvements"), the agent:
 
-1. **Found and fixed 6 implementation bugs/gaps** — visibility tags, missing side effects, bypassed safety checks, dead code paths, missing maintenance triggers
+1. **Found and fixed 6 implementation bugs/gaps** (v1.1–v1.5) — visibility tags, missing side effects, bypassed safety checks, dead code paths, missing maintenance triggers
 2. **Searched arXiv** for 5 papers across hallucination detection and agent long-task management
 3. **Produced a prioritized 10-item roadmap** mapping paper findings to specific code changes
+4. **Found and fixed 5 additional issues** (v1.7) — 2 policy rules using wrong field name (`condition` instead of `precondition`, silently never firing), double event emission in select phase, 5 event types with no log handlers, incomplete public API exports
 
 ### The 5 Papers Reviewed
 
@@ -382,7 +384,7 @@ See the [research-driven roadmap](#resulting-improvement-roadmap-priority-order)
 - **Richer observation** — Blackboard DELTA zones showing what changed, not just what exists (from 2405.14205)
 - **Structured task memory** — Hierarchical tree replacing flat episodic index, with per-node state tracking (from 2504.08525)
 - **LLM-guided memory management** — Replace frequency-counting reflection with actual LLM consolidation (from 2512.13564)
-- **Executive Agent** — Hierarchical delegation with policy injection into workers, shared/private memory partitions
+- **Executive Agent** — Multi-agent hierarchy inspired by Learning by Cheating (1912.12294). Executive agents face the user, interpret commands, spawn/monitor workers, and synthesize results. Small action space (~10 actions: `spawn_worker`, `spawn_executive`, `message_user`, `send_to_agent`, `wait_for_agents`, `collect_results`, `terminate_agent`, `think`, `done`). Workers carry the rich operational action space (browser, code, test, shell). Recursive `spawn_executive` enables hierarchies, swarms, and adversarial executive pairs. Blackboard lens system already supports per-role visibility filtering.
 - **World model** — Cheap model predicting action outcomes before committing (from 2405.14205)
 - **Benchmark Evaluation** — SWE-bench, WebArena
 - **Distillation Pipeline** — Worker execution traces → smaller/cheaper models for well-understood tasks
