@@ -4,6 +4,13 @@
   "description": "Default policy for worker agents. Safety rules, escalation on failure, skill preferences.",
   "rules": [
     {
+      "id": "net-access-approval",
+      "priority": 1000,
+      "condition": "action.type === 'bash' && /curl|wget|git clone|git pull|git push|fetch|npm install/.test(action.command)",
+      "effect": "escalate",
+      "message": "Network access requested: {{action.command}} — approve or deny?"
+    },
+    {
       "id": "allow-self-modification",
       "priority": 900,
       "description": "Allow the agent to modify its own source files, skills, and extension code for self-improvement",
