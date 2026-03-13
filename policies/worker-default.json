@@ -10,7 +10,7 @@
       "condition": "action modifies files in src/, skills/, or .pi/extensions/",
       "effect": "boost",
       "boost": 0.2
-    }
+    },
     {
       "id": "safety-no-rm-rf",
       "description": "Block rm -rf on root or home paths",
