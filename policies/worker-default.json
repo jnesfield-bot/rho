@@ -4,6 +4,14 @@
   "description": "Default policy for worker agents. Safety rules, escalation on failure, skill preferences.",
   "rules": [
     {
+      "id": "allow-self-modification",
+      "priority": 900,
+      "description": "Allow the agent to modify its own source files, skills, and extension code for self-improvement",
+      "condition": "action modifies files in src/, skills/, or .pi/extensions/",
+      "effect": "boost",
+      "boost": 0.2
+    }
+    {
       "id": "safety-no-rm-rf",
       "description": "Block rm -rf on root or home paths",
       "priority": 1000,
