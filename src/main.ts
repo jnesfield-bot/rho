@@ -19,6 +19,11 @@ const ICONS: Record<string, string> = {
   heartbeat_end: "✅",
   loop_paused: "⏸️ ",
   loop_error: "❌",
+  impasse_detected: "🚨",
+  memory_write: "📝",
+  skill_step_start: "🔧",
+  skill_step_end: "🔧",
+  skill_complete: "🎯",
 };
 
 function logEvent(event: LoopEvent): void {
@@ -58,6 +63,31 @@ function logEvent(event: LoopEvent): void {
 
     case "select_complete":
       console.log(`${icon} SELECT — Chose: ${event.selected.type}: ${event.selected.description}`);
+      if ((event as any).policyLog?.length) {
+        for (const entry of (event as any).policyLog) {
+          console.log(`   📋 Policy: ${entry.effect} ${entry.rule ?? ""} ${entry.message ?? ""}`);
+        }
+      }
+      break;
+
+    case "impasse_detected":
+      console.log(`🚨 IMPASSE — ${event.impasseType}: ${event.message}`);
+      break;
+
+    case "memory_write":
+      console.log(`📝 MEMORY — ${event.store}: ${event.key}`);
+      break;
+
+    case "skill_step_start":
+      console.log(`   🔧 Skill step ${event.step + 1}: ${event.description}`);
+      break;
+
+    case "skill_step_end":
+      console.log(`   ${event.success ? "✓" : "✗"} Skill step ${event.step + 1} ${event.success ? "succeeded" : "failed"}`);
+      break;
+
+    case "skill_complete":
+      console.log(`🎯 SKILL ${event.skill} — ${event.success ? "completed" : "FAILED"} (${event.steps} steps)`);
       break;
 
     case "act_complete":

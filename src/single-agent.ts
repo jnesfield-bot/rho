@@ -757,6 +757,7 @@ export class SingleAgent extends AgentLoop {
     if (this.policy?.rules) {
       const result = this.applyPolicyRules(scoredActions);
 
+      this._selectEmitted = true;
       this.emit({
         type: "select_complete",
         selected: result.action,
@@ -768,6 +769,7 @@ export class SingleAgent extends AgentLoop {
     }
 
     // ── Fallback: greedy select (no policy loaded) ───────
+    // Let the base class emit select_complete (_selectEmitted stays false)
     const sorted = [...scoredActions].sort((a, b) => b.value - a.value);
     return sorted[0].action;
   }

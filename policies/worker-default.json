@@ -5,18 +5,19 @@
   "rules": [
     {
       "id": "net-access-approval",
+      "description": "Escalate when network access is requested via curl, wget, git, npm install, etc.",
       "priority": 1000,
-      "condition": "action.type === 'bash' && /curl|wget|git clone|git pull|git push|fetch|npm install/.test(action.command)",
+      "precondition": { "type": "action_match", "field": "params.command", "pattern": "curl\\s|wget\\s|git\\s+(clone|pull|push|fetch)|npm\\s+install" },
       "effect": "escalate",
-      "message": "Network access requested: {{action.command}} — approve or deny?"
+      "message": "Network access requested — approve or deny?"
     },
     {
       "id": "allow-self-modification",
+      "description": "Boost actions that modify agent source files, skills, or extension code for self-improvement",
       "priority": 900,
-      "description": "Allow the agent to modify its own source files, skills, and extension code for self-improvement",
-      "condition": "action modifies files in src/, skills/, or .pi/extensions/",
+      "precondition": { "type": "action_match", "field": "params.path", "pattern": "(^|/)src/|skills/|.pi/extensions/" },
       "effect": "boost",
-      "boost": 0.2
+      "boostValue": 0.2
     },
     {
       "id": "safety-no-rm-rf",

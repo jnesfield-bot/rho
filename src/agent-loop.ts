@@ -27,6 +27,8 @@ export abstract class AgentLoop {
   protected lastState: State | null = null;
   protected lastResult: ActionResult | null = null;
   protected activeSkill: SkillExecution | null = null;
+  /** Set by subclasses when they emit select_complete themselves (prevents double emit) */
+  protected _selectEmitted = false;
   private listeners: LoopEventListener[] = [];
 
   constructor(config: AgentLoopConfig) {
@@ -124,8 +126,13 @@ export abstract class AgentLoop {
       }
 
       // 3. SELECT
+      // Note: subclasses (e.g. SingleAgent) may emit select_complete with extra
+      // fields like policyLog. We emit a fallback here only if they didn't.
       const action = this.select(scoredActions);
-      this.emit({ type: "select_complete", selected: action, timestamp: Date.now() });
+      if (!this._selectEmitted) {
+        this.emit({ type: "select_complete", selected: action, timestamp: Date.now() });
+      }
+      this._selectEmitted = false;
 
       // 4. ACT
       const result = await this.act(action);
