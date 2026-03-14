@@ -62,7 +62,7 @@ for (const repo of repos) {
 
   try {
     execSync(
-      `node ${indexScript} "${repo}" --output "${indexPath}" --lang ${lang}`,
+      `node ${JSON.stringify(indexScript)} ${JSON.stringify(repo)} --output ${JSON.stringify(indexPath)} --lang ${JSON.stringify(lang)}`,
       { encoding: "utf-8", timeout: 180000, stdio: ["pipe", "pipe", "pipe"] }
     );
     if (existsSync(indexPath)) {
@@ -85,12 +85,12 @@ if (indexFiles.length === 0) {
 
 console.error(`\n  🔍 Searching ${indexFiles.length} indices...`);
 
-const indexArgs = indexFiles.map(f => `--index "${f}"`).join(" ");
+const indexArgs = indexFiles.map(f => `--index ${JSON.stringify(f)}`).join(" ");
 const contextFlag = showContext ? "--context" : "";
 
 try {
   const result = execSync(
-    `node ${searchScript} "${query}" ${indexArgs} --top ${topN} ${contextFlag}`,
+    `node ${JSON.stringify(searchScript)} ${JSON.stringify(query)} ${indexArgs} --top ${JSON.stringify(String(topN))} ${contextFlag}`,
     { encoding: "utf-8", timeout: 60000, maxBuffer: 10 * 1024 * 1024 }
   );
   console.log(result);

@@ -293,7 +293,7 @@ function executeInline(
         if (!existsSync(fullPath)) return { success: false, output: "", error: `File not found: ${path}`, durationMs: Date.now() - startTime };
         const fileContent = readFileSync(fullPath, "utf-8");
         if (!fileContent.includes(oldText)) return { success: false, output: "", error: `Text not found in ${path}`, durationMs: Date.now() - startTime };
-        writeFileSync(fullPath, fileContent.replace(oldText, newText));
+        writeFileSync(fullPath, fileContent.replaceAll(oldText, newText));
         return { success: true, output: `Edited ${path}`, durationMs: Date.now() - startTime };
       }
 
@@ -743,7 +743,7 @@ export default function (pi: ExtensionAPI) {
     renderCall(args, theme) {
       // renderCall fires before execute — selection hasn't happened yet.
       // Show what the LLM proposed; policy will decide in execute().
-      const { Text } = require("@mariozechner/pi-tui");
+      const { Text } = await import("@mariozechner/pi-tui");
       let text = theme.fg("toolTitle", theme.bold("heartbeat "));
       text += theme.fg("accent", `#${state.heartbeat + 1}`);
       text += theme.fg("dim", ` — ${args.candidates?.length ?? 0} candidates proposed`);

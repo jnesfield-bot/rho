@@ -1356,7 +1356,7 @@ Respond with ONLY "continue" or "abort".`;
     const fullPath = path.startsWith("/") ? path : join(this.config.workDir, path);
     const content = await readFile(fullPath, "utf-8");
     if (!content.includes(oldText)) throw new Error(`Text not found in ${path}`);
-    await writeFile(fullPath, content.replace(oldText, newText));
+    await writeFile(fullPath, content.replaceAll(oldText, newText));
   }
 
   // ── Search Tools ───────────────────────────────────────────
@@ -1375,7 +1375,9 @@ Respond with ONLY "continue" or "abort".`;
     if (options?.include) flags.push(`--include="${options.include}"`);
     if (options?.exclude) flags.push(`--exclude="${options.exclude}"`);
     if (options?.context) flags.push(`-C ${options.context}`);
-    const cmd = `grep ${flags.join(" ")} "${pattern.replace(/"/g, '\\"')}" ${target}`;
+    const safePattern = pattern.replace(/[`$\\!"';\n\r|&<>(){}]/g, "\\$&");
+    const safeTarget = target.replace(/[`$\\!"';\n\r|&<>(){}]/g, "\\$&");
+    const cmd = `grep ${flags.join(" ")} "${safePattern}" ${safeTarget}`;
     return this.executeBash(cmd);
   }
 
@@ -1391,7 +1393,10 @@ Respond with ONLY "continue" or "abort".`;
     const parts = ["find", target];
     if (maxDepth != null) parts.push(`-maxdepth ${maxDepth}`);
     if (type) parts.push(`-type ${type}`);
-    if (pattern) parts.push(`-name "${pattern.replace(/"/g, '\\"')}"`);
+    if (pattern) {
+      const safePattern = pattern.replace(/[`$\\!"';\n\r|&<>(){}]/g, "\\$&");
+      parts.push(`-name "${safePattern}"`);
+    }
     parts.push("| head -100");
     return this.executeBash(parts.join(" "));
   }

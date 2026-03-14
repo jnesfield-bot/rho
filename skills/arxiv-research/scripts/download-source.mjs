@@ -19,6 +19,11 @@ if (!arxivId || !outputDir) {
   process.exit(1);
 }
 
+// Sanitize arxivId to prevent shell injection (only allow valid arXiv ID chars)
+if (!/^[\w.\-\/]+$/.test(arxivId)) {
+  console.error("Invalid arXiv ID format");
+  process.exit(1);
+}
 const url = `https://arxiv.org/e-print/${arxivId}`;
 const tarPath = join(outputDir, `${arxivId.replace("/", "-")}.tar.gz`);
 

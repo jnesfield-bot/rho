@@ -43,7 +43,7 @@ if (isUrl) {
   repoDir = join("/tmp", `code-search-${repoName}-${Date.now().toString(36)}`);
   console.error(`Cloning ${repoArg} → ${repoDir}...`);
   try {
-    execSync(`git clone --depth 1 ${repoArg} ${repoDir}`, {
+    execSync(`git clone --depth 1 -- ${JSON.stringify(repoArg)} ${JSON.stringify(repoDir)}`, {
       encoding: "utf-8", timeout: 120000, stdio: ["pipe", "pipe", "pipe"],
     });
   } catch (err) {
