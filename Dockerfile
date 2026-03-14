@@ -19,6 +19,9 @@ COPY tests/ ./tests/
 COPY .pi/ ./.pi/
 COPY test-all.sh ./
 
+# Sync extension source → pi extension (single source of truth)
+RUN cp src/extension.ts .pi/extensions/rho.ts
+
 RUN mkdir -p /workspace /buffer
 
 ENV REPLAY_BUFFER_DIR=/buffer
