@@ -15,7 +15,8 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { existsSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
+import { execSync } from "child_process";
 import { join } from "path";
 
 // ── Policy Types ─────────────────────────────────────────
@@ -222,6 +223,89 @@ function checkPolicy(
 }
 
 /**
+ * Execute a primitive action inline within the heartbeat tool.
+ * Eliminates the 2-step overhead where heartbeat records a decision
+ * and then the LLM has to make a separate pi tool call to execute.
+ *
+ * Now: one heartbeat = one complete Observe → Evaluate → Select → Act cycle.
+ * This matches SingleAgent.executePrimitive() — same execution model in both modes.
+ */
+function executeInline(
+  actionType: string,
+  params: Record<string, unknown>,
+  cwd: string,
+): { success: boolean; output: string; error?: string; durationMs: number } {
+  const startTime = Date.now();
+
+  try {
+    switch (actionType) {
+      case "bash": {
+        const command = params.command as string;
+        if (!command) return { success: false, output: "", error: "bash requires params.command", durationMs: Date.now() - startTime };
+        try {
+          const output = execSync(command, {
+            encoding: "utf-8",
+            cwd,
+            timeout: 60000,
+            maxBuffer: 1024 * 1024,
+          });
+          return { success: true, output: output.substring(0, 10000), durationMs: Date.now() - startTime };
+        } catch (err: any) {
+          // execSync throws on non-zero exit — capture stdout/stderr
+          const output = ((err.stdout as string) || "") + ((err.stderr as string) || "");
+          if (output.trim()) {
+            // Command produced output but exited non-zero (e.g., grep with no matches)
+            return { success: false, output: output.substring(0, 10000), error: `Exit code ${err.status ?? "unknown"}`, durationMs: Date.now() - startTime };
+          }
+          return { success: false, output: "", error: (err.message ?? String(err)).substring(0, 200), durationMs: Date.now() - startTime };
+        }
+      }
+
+      case "read": {
+        const path = params.path as string;
+        if (!path) return { success: false, output: "", error: "read requires params.path", durationMs: Date.now() - startTime };
+        const fullPath = path.startsWith("/") ? path : join(cwd, path);
+        if (!existsSync(fullPath)) return { success: false, output: "", error: `File not found: ${path}`, durationMs: Date.now() - startTime };
+        const content = readFileSync(fullPath, "utf-8");
+        return { success: true, output: content.substring(0, 10000), durationMs: Date.now() - startTime };
+      }
+
+      case "write": {
+        const path = params.path as string;
+        const content = params.content as string;
+        if (!path) return { success: false, output: "", error: "write requires params.path", durationMs: Date.now() - startTime };
+        if (content == null) return { success: false, output: "", error: "write requires params.content", durationMs: Date.now() - startTime };
+        const fullPath = path.startsWith("/") ? path : join(cwd, path);
+        const dir = fullPath.substring(0, fullPath.lastIndexOf("/"));
+        if (dir) mkdirSync(dir, { recursive: true });
+        writeFileSync(fullPath, content);
+        return { success: true, output: `Wrote ${path} (${content.length} bytes)`, durationMs: Date.now() - startTime };
+      }
+
+      case "edit": {
+        const path = params.path as string;
+        const oldText = params.oldText as string;
+        const newText = params.newText as string;
+        if (!path) return { success: false, output: "", error: "edit requires params.path", durationMs: Date.now() - startTime };
+        if (!oldText) return { success: false, output: "", error: "edit requires params.oldText", durationMs: Date.now() - startTime };
+        if (newText == null) return { success: false, output: "", error: "edit requires params.newText", durationMs: Date.now() - startTime };
+        const fullPath = path.startsWith("/") ? path : join(cwd, path);
+        if (!existsSync(fullPath)) return { success: false, output: "", error: `File not found: ${path}`, durationMs: Date.now() - startTime };
+        const fileContent = readFileSync(fullPath, "utf-8");
+        if (!fileContent.includes(oldText)) return { success: false, output: "", error: `Text not found in ${path}`, durationMs: Date.now() - startTime };
+        writeFileSync(fullPath, fileContent.replace(oldText, newText));
+        return { success: true, output: `Edited ${path}`, durationMs: Date.now() - startTime };
+      }
+
+      default:
+        return { success: false, output: "", error: `Unknown action type for inline execution: ${actionType}`, durationMs: Date.now() - startTime };
+    }
+  } catch (err: any) {
+    return { success: false, output: "", error: (err.message ?? String(err)).substring(0, 200), durationMs: Date.now() - startTime };
+  }
+}
+
+/**
  * Deterministic action selection with full policy gating.
  * Mirrors SingleAgent.applyPolicyRules() — the LLM proposes, this function decides.
  *
@@ -397,9 +481,9 @@ export default function (pi: ExtensionAPI) {
     description: [
       "Execute one heartbeat of the agent loop. Call this repeatedly to drive the Observe → Evaluate → Select → Act cycle.",
       "You propose and score candidate actions (Evaluate). The POLICY ENGINE selects which action to execute (Select). You do NOT choose — propose honestly and let the policy decide.",
-      "After the policy selects and you execute the action, call heartbeat again with the results.",
+      "The heartbeat tool executes the selected action directly and returns the result. Call heartbeat again to continue.",
     ].join(" "),
-    promptSnippet: "Drive the agent loop: observe state, propose scored actions, policy selects, execute",
+    promptSnippet: "Drive the agent loop: observe state, propose scored actions, policy selects, action executes inline, returns result",
     promptGuidelines: [
       "When running a /loop task, call heartbeat repeatedly until complete or max heartbeats reached.",
       "Each heartbeat: observe the current state, then propose 1-5 candidate actions with honest value scores.",
@@ -601,17 +685,41 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // For bash/read/write/edit — tell the LLM to use the actual pi tools
-      state.lastAction = { type: selected.action_type, description: selected.description, success: true };
-      state.consecutiveFailures = 0;
+      // ── Execute bash/read/write/edit inline ──
+      // One heartbeat = one complete Observe → Evaluate → Select → Act cycle.
+      // No 2-step overhead. The action executes here and the result is returned.
+      const cwd = ctx.cwd ?? process.cwd();
+      const execResult = executeInline(selected.action_type, selected.params ?? {}, cwd);
+
+      // Update history with actual execution result
+      const histEntry = state.history[state.history.length - 1];
+      histEntry.success = execResult.success;
+      histEntry.output = execResult.output.substring(0, 200);
+
+      state.lastAction = { type: selected.action_type, description: selected.description, success: execResult.success };
+
+      if (execResult.success) {
+        state.consecutiveFailures = 0;
+      } else {
+        state.consecutiveFailures++;
+      }
 
       const remaining = state.maxHeartbeats - state.heartbeat;
       const memoryStr = Object.keys(state.memory).length > 0
         ? `\n\nMemory:\n${Object.entries(state.memory).map(([k, v]) => `  ${k}: ${v}`).join("\n")}`
         : "";
 
+      const icon = execResult.success ? "✓" : "✗";
+      const resultSummary = execResult.error
+        ? `\nResult: ${icon} FAILED (${execResult.durationMs}ms)\nError: ${execResult.error}`
+        : `\nResult: ${icon} OK (${execResult.durationMs}ms)`;
+
+      const outputStr = execResult.output
+        ? `\n\nOutput:\n${execResult.output.substring(0, 5000)}`
+        : "";
+
       return {
-        content: [{ type: "text", text: `🎯 Heartbeat #${state.heartbeat}: Policy selected ${selected.action_type} (value: ${selected.value.toFixed(2)})${policyLogStr}\n\nAction: ${selected.description}\n\nNow execute this action using the appropriate tool (bash, read, write, or edit). Then call heartbeat again with the results.\n\n${remaining} heartbeats remaining.${memoryStr}` }],
+        content: [{ type: "text", text: `🎯 Heartbeat #${state.heartbeat}: Policy selected ${selected.action_type} (value: ${selected.value.toFixed(2)})${policyLogStr}\n\nAction: ${selected.description}${resultSummary}${outputStr}\n\nContinue calling heartbeat. ${remaining} heartbeats remaining.${memoryStr}` }],
         details: {
           state: "running",
           heartbeat: state.heartbeat,
@@ -620,6 +728,12 @@ export default function (pi: ExtensionAPI) {
             description: selected.description,
             value: selected.value,
             params: selected.params,
+          },
+          result: {
+            success: execResult.success,
+            output: execResult.output.substring(0, 2000),
+            error: execResult.error,
+            durationMs: execResult.durationMs,
           },
           policyLog: selection.log,
         },
@@ -691,7 +805,7 @@ Drive the task by calling the \`heartbeat\` tool repeatedly. Each call is one cy
 1. **Observe** — Describe what you see (files, state, prior results)
 2. **Evaluate** — Propose 1-5 candidate actions with value scores (0.0-1.0). Be honest — propose ALL reasonable options.
 3. **Select** — The POLICY ENGINE selects the action, not you. You do not choose. Propose candidates and the deterministic policy decides.
-4. **Act** — Execute the policy-selected action using the appropriate tool (bash, read, write, edit), then call heartbeat again.
+4. **Act** — The heartbeat executes the selected action inline and returns the result. No separate tool call needed.
 
 **Important**: You propose and score. The policy engine selects. Do NOT self-censor — if an action is relevant, propose it even if you think policy might block it. The policy engine handles safety.
 
