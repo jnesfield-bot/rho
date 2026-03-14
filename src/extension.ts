@@ -222,6 +222,122 @@ function checkPolicy(
 }
 
 /**
+ * Deterministic action selection with full policy gating.
+ * Mirrors SingleAgent.applyPolicyRules() — the LLM proposes, this function decides.
+ *
+ * Flow (matches the paper's Evaluate → Select contract):
+ *   1. First pass: apply boost and filter rules across ALL candidates
+ *   2. Sort by value (highest first — greedy after boosts)
+ *   3. Second pass: check each candidate top-down for block/override/escalate
+ *   4. Return the first surviving candidate
+ *
+ * The LLM NEVER selects. It only proposes and scores. This function decides.
+ */
+
+type Candidate = {
+  action_type: string;
+  description: string;
+  value: number;
+  reasoning: string;
+  params?: Record<string, unknown>;
+};
+
+interface SelectionResult {
+  selected: Candidate | null;
+  effect: "selected" | "all_blocked" | "escalated" | "overridden";
+  log: Array<{ rule: string; effect: string; message?: string; target?: string }>;
+  message?: string;
+  rule?: PolicyRule;
+  overrideAction?: any;
+}
+
+function selectAction(candidates: Candidate[]): SelectionResult {
+  if (!candidates.length) {
+    return { selected: null, effect: "all_blocked", log: [], message: "No candidates provided" };
+  }
+
+  if (!state.policy?.rules) {
+    // No policy — greedy select by value
+    const sorted = [...candidates].sort((a, b) => b.value - a.value);
+    return { selected: sorted[0], effect: "selected", log: [] };
+  }
+
+  // Clone candidates so we can mutate value scores during boost
+  let pool = candidates.map(c => ({ ...c }));
+  const log: SelectionResult["log"] = [];
+  const rules = [...state.policy.rules]
+    .filter((r: any) => !(r as any)._disabled)
+    .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
+  const taskDescription = state.task ?? "";
+
+  // ── First pass: boost and filter across all candidates ──
+  for (const rule of rules) {
+    if (rule.effect === "boost" && matchPrecondition(rule, null, taskDescription)) {
+      for (const c of pool) {
+        const isMatch = (rule as any).skillName
+          ? c.action_type === `skill:${(rule as any).skillName}`
+          : ((rule as any).actionType && c.action_type === (rule as any).actionType);
+        if (isMatch) {
+          c.value += (rule as any).boostValue ?? 0.1;
+          log.push({ rule: rule.id, effect: "boost", target: c.description?.substring(0, 30) });
+        }
+      }
+    }
+
+    if (rule.effect === "filter" && matchPrecondition(rule, null, taskDescription)) {
+      const before = pool.length;
+      pool = pool.filter(c => {
+        if ((rule as any).actionType && c.action_type === (rule as any).actionType) return false;
+        return true;
+      });
+      if (pool.length < before) {
+        log.push({ rule: rule.id, effect: "filter", message: `Removed ${before - pool.length} candidates` });
+      }
+    }
+  }
+
+  // Sort by value after boosts (highest first = greedy selection)
+  pool.sort((a, b) => b.value - a.value);
+
+  // ── Second pass: check each candidate top-down for block/override/escalate ──
+  for (const candidate of pool) {
+    let blocked = false;
+
+    for (const rule of rules) {
+      if (!matchPrecondition(rule, candidate, taskDescription)) continue;
+
+      if (rule.effect === "block") {
+        log.push({ rule: rule.id, effect: "block", target: candidate.description?.substring(0, 30), message: rule.message });
+        blocked = true;
+        break;
+      }
+
+      if (rule.effect === "override" && rule.action) {
+        log.push({ rule: rule.id, effect: "override", message: rule.message });
+        return { selected: null, effect: "overridden", log, overrideAction: rule.action, rule, message: rule.message };
+      }
+
+      if (rule.effect === "escalate") {
+        log.push({ rule: rule.id, effect: "escalate", message: rule.message });
+        return { selected: null, effect: "escalated", log, rule, message: rule.message ?? `Escalation: ${rule.id}` };
+      }
+
+      if (rule.effect === "log") {
+        log.push({ rule: rule.id, effect: "log", message: rule.message });
+      }
+    }
+
+    if (!blocked) {
+      return { selected: candidate, effect: "selected", log };
+    }
+  }
+
+  // All candidates blocked
+  log.push({ rule: "policy", effect: "all_blocked", message: "Every candidate was blocked by policy" });
+  return { selected: null, effect: "all_blocked", log, message: "All proposed actions were blocked by policy" };
+}
+
+/**
  * Format a human-readable policy summary for inclusion in the loop prompt.
  * Groups rules by tier so the LLM understands what's enforced.
  */
@@ -280,15 +396,17 @@ export default function (pi: ExtensionAPI) {
     label: "Agent Loop Heartbeat",
     description: [
       "Execute one heartbeat of the agent loop. Call this repeatedly to drive the Observe → Evaluate → Select → Act cycle.",
-      "You MUST respond with a JSON object containing your evaluation and selected action.",
-      "After executing the action, call heartbeat again with the result until the task is complete.",
+      "You propose and score candidate actions (Evaluate). The POLICY ENGINE selects which action to execute (Select). You do NOT choose — propose honestly and let the policy decide.",
+      "After the policy selects and you execute the action, call heartbeat again with the results.",
     ].join(" "),
-    promptSnippet: "Drive the agent loop: observe state, evaluate actions, select best, execute",
+    promptSnippet: "Drive the agent loop: observe state, propose scored actions, policy selects, execute",
     promptGuidelines: [
       "When running a /loop task, call heartbeat repeatedly until complete or max heartbeats reached.",
-      "Each heartbeat: observe the current state, propose scored actions, select the best one, and execute it.",
-      "Always include your reasoning for action selection.",
-      "A safety policy may be active. If your action is blocked, choose a different approach — don't retry the same blocked action.",
+      "Each heartbeat: observe the current state, then propose 1-5 candidate actions with honest value scores.",
+      "You do NOT select which action to take. The deterministic policy engine evaluates all candidates, applies safety rules (block/boost/filter/escalate/override), and selects the best surviving candidate.",
+      "Propose ALL reasonable actions — even ones you think policy might block. The policy engine handles filtering. Your job is honest evaluation, not self-censoring.",
+      "Always include your reasoning for each candidate's score.",
+      "For update_memory, you MUST include params: { key: \"...\", value: \"...\" }.",
       "Users can ask about or change policy rules in natural language. Help them understand what's blocked and why.",
       "Use /loop-policy show to display current rules when a user asks about the policy.",
     ],
@@ -304,7 +422,6 @@ export default function (pi: ExtensionAPI) {
         }),
         { description: "1-5 candidate actions with scores" }
       ),
-      selected_index: Type.Number({ description: "Index of the candidate you selected (0-based)" }),
     }),
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -315,45 +432,137 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      state.heartbeat++;
-      updateStatus(ctx);
-
-      // Log the evaluation
-      const selected = params.candidates[params.selected_index] || params.candidates[0];
-      if (!selected) {
+      if (!params.candidates?.length) {
         return {
           content: [{ type: "text", text: "No candidates provided. Propose at least one action." }],
           details: { state: "error" },
         };
       }
 
+      state.heartbeat++;
+      updateStatus(ctx);
+
+      // ── EVALUATE phase complete: LLM proposed candidates ──
+      // ── SELECT phase: deterministic policy-gated selection ──
+      // The LLM proposed and scored. Now the policy engine decides.
+      const selection = selectAction(params.candidates);
+
+      // Build candidate summary showing what was proposed
+      const candidateSummary = params.candidates
+        .map((c) => `  [${c.value.toFixed(2)}] ${c.action_type}: ${c.description}`)
+        .join("\n");
+
+      const policyLogStr = selection.log.length > 0
+        ? "\n\nPolicy log:\n" + selection.log.map(l => `  📋 ${l.effect}: ${l.rule} ${l.message ?? ""}`).join("\n")
+        : "";
+
+      // ── Handle escalation (policy fires before any candidate is selected) ──
+      if (selection.effect === "escalated") {
+        state.history.push({
+          heartbeat: state.heartbeat,
+          action: `ESCALATED: ${selection.message}`,
+          value: 0,
+          success: false,
+          output: `Policy escalation: ${selection.message}`,
+        });
+        state.lastAction = { type: "escalate", description: selection.message ?? "Policy escalation", success: false };
+        state.consecutiveFailures++;
+        return {
+          content: [{ type: "text", text: `⚠️ Heartbeat #${state.heartbeat}: Policy ESCALATION\n\nRule: ${selection.rule?.id} (priority ${selection.rule?.priority})\nMessage: ${selection.message}\n\nCandidates proposed:\n${candidateSummary}${policyLogStr}\n\nThe policy engine escalated before any action could be selected. Propose different approaches.\n\n${state.maxHeartbeats - state.heartbeat} heartbeats remaining.` }],
+          details: { state: "escalated", heartbeat: state.heartbeat, rule: selection.rule?.id, message: selection.message, policyLog: selection.log },
+        };
+      }
+
+      // ── Handle all candidates blocked ──
+      if (selection.effect === "all_blocked") {
+        state.history.push({
+          heartbeat: state.heartbeat,
+          action: `ALL BLOCKED: ${selection.message}`,
+          value: 0,
+          success: false,
+          output: selection.message ?? "All candidates blocked",
+        });
+        state.lastAction = { type: "blocked", description: selection.message ?? "All blocked", success: false };
+        state.consecutiveFailures++;
+        return {
+          content: [{ type: "text", text: `🚫 Heartbeat #${state.heartbeat}: ALL candidates BLOCKED by policy\n\nCandidates proposed:\n${candidateSummary}${policyLogStr}\n\nEvery proposed action was rejected by policy rules. Propose different actions that comply with the active policy.\n\n${state.maxHeartbeats - state.heartbeat} heartbeats remaining.` }],
+          details: { state: "blocked", heartbeat: state.heartbeat, policyLog: selection.log },
+        };
+      }
+
+      // ── Handle policy override (policy replaces the action entirely) ──
+      if (selection.effect === "overridden" && selection.overrideAction) {
+        const override = selection.overrideAction;
+        state.history.push({
+          heartbeat: state.heartbeat,
+          action: `OVERRIDE → ${override.type}: ${override.description}`,
+          value: 0,
+          success: true,
+          output: `Policy override by ${selection.rule?.id}`,
+        });
+
+        if (override.type === "complete") {
+          state.running = false;
+          state.lastAction = { type: "complete", description: override.description, success: true };
+          updateStatus(ctx);
+          return {
+            content: [{ type: "text", text: `✅ Task auto-completed by policy rule: ${selection.rule?.id}\n\nReason: ${override.description}${policyLogStr}\n\nAction history:\n${state.history.map(h => `  #${h.heartbeat} [${h.value.toFixed(2)}] ${h.action}`).join("\n")}` }],
+            details: { state: "complete", history: state.history, policyLog: selection.log },
+          };
+        }
+
+        if (override.type === "wait") {
+          state.lastAction = { type: "wait", description: override.description, success: true };
+          return {
+            content: [{ type: "text", text: `⏳ Heartbeat #${state.heartbeat}: Policy override → wait\n\nRule: ${selection.rule?.id}\nReason: ${override.description}${policyLogStr}\n\n${state.maxHeartbeats - state.heartbeat} heartbeats remaining.` }],
+            details: { state: "waiting", heartbeat: state.heartbeat, policyLog: selection.log },
+          };
+        }
+
+        // Other override action types
+        state.lastAction = { type: override.type, description: override.description, success: true };
+        return {
+          content: [{ type: "text", text: `🔀 Heartbeat #${state.heartbeat}: Policy OVERRIDE\n\nRule: ${selection.rule?.id}\nOverride action: ${override.type}: ${override.description}${policyLogStr}\n\n${state.maxHeartbeats - state.heartbeat} heartbeats remaining.` }],
+          details: { state: "overridden", heartbeat: state.heartbeat, override, policyLog: selection.log },
+        };
+      }
+
+      // ── Normal selection — policy approved this candidate ──
+      const selected = selection.selected!;
+
+      // Track action for rate-limiting rules
+      state.recentActions.push({ type: selected.action_type, timestamp: Date.now() });
+      if (state.recentActions.length > 50) state.recentActions.shift();
+
       // Record in history
       state.history.push({
         heartbeat: state.heartbeat,
         action: `${selected.action_type}: ${selected.description}`,
         value: selected.value,
-        success: true, // will update below if needed
+        success: true,
         output: "",
       });
 
-      // Build status update
-      const candidateSummary = params.candidates
-        .map((c, i) => `  ${i === params.selected_index ? "→" : " "} [${c.value.toFixed(2)}] ${c.action_type}: ${c.description}`)
-        .join("\n");
+      // Show what the policy selected vs what was proposed
+      const selectionNote = selection.log.length > 0
+        ? `\n\nPolicy evaluated ${params.candidates.length} candidates (${selection.log.length} rules fired).${policyLogStr}`
+        : `\n\nPolicy: no rules applied — selected highest-value candidate.`;
 
       onUpdate?.({
-        content: [{ type: "text", text: `Heartbeat #${state.heartbeat}\n\nObservation: ${params.observation}\n\nCandidates:\n${candidateSummary}\n\nSelected: ${selected.action_type}` }],
-        details: { heartbeat: state.heartbeat, selected: selected.action_type },
+        content: [{ type: "text", text: `Heartbeat #${state.heartbeat}\n\nObservation: ${params.observation}\n\nCandidates (LLM proposed):\n${candidateSummary}\n\nPolicy selected: ${selected.action_type} [${selected.value.toFixed(2)}]${selectionNote}` }],
+        details: { heartbeat: state.heartbeat, selected: selected.action_type, policyLog: selection.log },
       });
 
-      // Handle special actions
+      // ── ACT: execute the policy-selected action ──
+
       if (selected.action_type === "complete") {
         state.running = false;
         state.lastAction = { type: "complete", description: selected.description, success: true };
+        state.consecutiveFailures = 0;
         updateStatus(ctx);
         return {
-          content: [{ type: "text", text: `✅ Task complete (${state.heartbeat} heartbeats).\n\nSummary: ${selected.description}\n\nAction history:\n${state.history.map(h => `  #${h.heartbeat} [${h.value.toFixed(2)}] ${h.action}`).join("\n")}` }],
-          details: { state: "complete", history: state.history },
+          content: [{ type: "text", text: `✅ Task complete (${state.heartbeat} heartbeats).${policyLogStr}\n\nSummary: ${selected.description}\n\nAction history:\n${state.history.map(h => `  #${h.heartbeat} [${h.value.toFixed(2)}] ${h.action}`).join("\n")}` }],
+          details: { state: "complete", history: state.history, policyLog: selection.log },
         };
       }
 
@@ -362,73 +571,39 @@ export default function (pi: ExtensionAPI) {
         const histEntry = state.history[state.history.length - 1];
         histEntry.output = "waited";
         return {
-          content: [{ type: "text", text: `⏳ Heartbeat #${state.heartbeat}: Waiting.\n\nContinue calling heartbeat. ${state.maxHeartbeats - state.heartbeat} heartbeats remaining.` }],
-          details: { state: "waiting", heartbeat: state.heartbeat },
+          content: [{ type: "text", text: `⏳ Heartbeat #${state.heartbeat}: Waiting.${policyLogStr}\n\nContinue calling heartbeat. ${state.maxHeartbeats - state.heartbeat} heartbeats remaining.` }],
+          details: { state: "waiting", heartbeat: state.heartbeat, policyLog: selection.log },
         };
       }
 
       if (selected.action_type === "update_memory") {
-        const key = selected.params?.key as string || "note";
-        const value = selected.params?.value as string || selected.description;
+        if (!selected.params?.key) {
+          const histEntry = state.history[state.history.length - 1];
+          histEntry.success = false;
+          histEntry.output = "ERROR: update_memory requires params.key and params.value";
+          state.lastAction = { type: "update_memory", description: "Missing params", success: false };
+          state.consecutiveFailures++;
+          return {
+            content: [{ type: "text", text: `❌ Heartbeat #${state.heartbeat}: update_memory requires params with "key" and "value" fields.\n\nYou must include: { "params": { "key": "your_key", "value": "your_value" } }\n\n${state.maxHeartbeats - state.heartbeat} heartbeats remaining.` }],
+            details: { state: "error", heartbeat: state.heartbeat },
+          };
+        }
+        const key = selected.params.key as string;
+        const value = selected.params?.value as string ?? selected.description;
         state.memory[key] = value;
         state.lastAction = { type: "update_memory", description: `Set ${key}`, success: true };
+        state.consecutiveFailures = 0;
         const histEntry = state.history[state.history.length - 1];
         histEntry.output = `memory[${key}] = ${value}`;
         return {
-          content: [{ type: "text", text: `📝 Memory updated: ${key} = ${value}\n\nCurrent memory:\n${Object.entries(state.memory).map(([k, v]) => `  ${k}: ${v}`).join("\n") || "  (empty)"}\n\nContinue calling heartbeat. ${state.maxHeartbeats - state.heartbeat} heartbeats remaining.` }],
-          details: { state: "running", memory: state.memory },
+          content: [{ type: "text", text: `📝 Memory updated: ${key} = ${value}${policyLogStr}\n\nCurrent memory:\n${Object.entries(state.memory).map(([k, v]) => `  ${k}: ${v}`).join("\n") || "  (empty)"}\n\nContinue calling heartbeat. ${state.maxHeartbeats - state.heartbeat} heartbeats remaining.` }],
+          details: { state: "running", memory: state.memory, policyLog: selection.log },
         };
       }
 
-      // ── Policy Check ───────────────────────────────────
-      // Before allowing execution, run the selected action through the policy engine.
-      // Safety rules (priority 1000+) can block dangerous commands like sudo, rm -rf /, etc.
-      const policyResult = checkPolicy(selected);
-      if (policyResult) {
-        if (policyResult.effect === "block") {
-          // Record the blocked action in history
-          const histEntry = state.history[state.history.length - 1];
-          histEntry.success = false;
-          histEntry.output = `BLOCKED: ${policyResult.message}`;
-
-          state.lastAction = { type: selected.action_type, description: selected.description, success: false };
-
-          return {
-            content: [{ type: "text", text: `🚫 Heartbeat #${state.heartbeat}: Action BLOCKED by policy\n\nRule: ${policyResult.rule.id} (priority ${policyResult.rule.priority})\nReason: ${policyResult.message}\n\nYour proposed action "${selected.action_type}: ${selected.description}" was rejected by the safety policy.\n\nPlease choose a different action. Call heartbeat again with an alternative.\n\n${state.maxHeartbeats - state.heartbeat} heartbeats remaining.` }],
-            details: {
-              state: "blocked",
-              heartbeat: state.heartbeat,
-              blockedBy: policyResult.rule.id,
-              message: policyResult.message,
-            },
-          };
-        }
-
-        if (policyResult.effect === "escalate") {
-          const histEntry = state.history[state.history.length - 1];
-          histEntry.output = `ESCALATED: ${policyResult.message}`;
-
-          state.lastAction = { type: "escalate", description: policyResult.message, success: true };
-
-          return {
-            content: [{ type: "text", text: `⚠️ Heartbeat #${state.heartbeat}: Policy escalation triggered\n\nRule: ${policyResult.rule.id}\nMessage: ${policyResult.message}\n\nPlease reconsider your approach or choose a safer alternative.\n\n${state.maxHeartbeats - state.heartbeat} heartbeats remaining.` }],
-            details: {
-              state: "escalated",
-              heartbeat: state.heartbeat,
-              rule: policyResult.rule.id,
-              message: policyResult.message,
-            },
-          };
-        }
-      }
-
-      // Track action for rate-limiting rules
-      state.recentActions.push({ type: selected.action_type, timestamp: Date.now() });
-      if (state.recentActions.length > 50) state.recentActions.shift();
-
       // For bash/read/write/edit — tell the LLM to use the actual pi tools
-      // The heartbeat tool records the decision; execution happens via pi's native tools
       state.lastAction = { type: selected.action_type, description: selected.description, success: true };
+      state.consecutiveFailures = 0;
 
       const remaining = state.maxHeartbeats - state.heartbeat;
       const memoryStr = Object.keys(state.memory).length > 0
@@ -436,7 +611,7 @@ export default function (pi: ExtensionAPI) {
         : "";
 
       return {
-        content: [{ type: "text", text: `🎯 Heartbeat #${state.heartbeat}: Selected ${selected.action_type} (value: ${selected.value.toFixed(2)})\n\nAction: ${selected.description}\n\nNow execute this action using the appropriate tool (bash, read, write, or edit). Then call heartbeat again with the results.\n\n${remaining} heartbeats remaining.${memoryStr}` }],
+        content: [{ type: "text", text: `🎯 Heartbeat #${state.heartbeat}: Policy selected ${selected.action_type} (value: ${selected.value.toFixed(2)})${policyLogStr}\n\nAction: ${selected.description}\n\nNow execute this action using the appropriate tool (bash, read, write, or edit). Then call heartbeat again with the results.\n\n${remaining} heartbeats remaining.${memoryStr}` }],
         details: {
           state: "running",
           heartbeat: state.heartbeat,
@@ -446,28 +621,26 @@ export default function (pi: ExtensionAPI) {
             value: selected.value,
             params: selected.params,
           },
+          policyLog: selection.log,
         },
       };
     },
 
     renderCall(args, theme) {
-      // Import at top level via require for sync renderCall
+      // renderCall fires before execute — selection hasn't happened yet.
+      // Show what the LLM proposed; policy will decide in execute().
       const { Text } = require("@mariozechner/pi-tui");
-      const selected = args.candidates?.[args.selected_index] || args.candidates?.[0];
       let text = theme.fg("toolTitle", theme.bold("heartbeat "));
       text += theme.fg("accent", `#${state.heartbeat + 1}`);
-      if (selected) {
-        text += " → " + theme.fg("warning", selected.action_type);
-        text += theme.fg("dim", ` (${selected.value?.toFixed(2) ?? "?"}) ${selected.description?.slice(0, 50) ?? ""}`);
-      }
-      if (args.candidates && args.candidates.length > 1) {
+      text += theme.fg("dim", ` — ${args.candidates?.length ?? 0} candidates proposed`);
+      if (args.candidates && args.candidates.length > 0) {
         text += "\n";
         for (let i = 0; i < Math.min(args.candidates.length, 5); i++) {
           const c = args.candidates[i];
-          const marker = i === args.selected_index ? "→" : " ";
           const bar = "█".repeat(Math.round((c.value || 0) * 10));
-          text += `\n  ${marker} [${(c.value || 0).toFixed(2)}] ${bar} ${theme.fg("muted", c.action_type)}: ${theme.fg("dim", (c.description || "").slice(0, 40))}`;
+          text += `\n  [${(c.value || 0).toFixed(2)}] ${bar} ${theme.fg("muted", c.action_type)}: ${theme.fg("dim", (c.description || "").slice(0, 40))}`;
         }
+        text += theme.fg("dim", "\n  ⏳ Policy engine will select...");
       }
       return new Text(text, 0, 0);
     },
@@ -516,13 +689,15 @@ ${state.task}
 
 Drive the task by calling the \`heartbeat\` tool repeatedly. Each call is one cycle of:
 1. **Observe** — Describe what you see (files, state, prior results)
-2. **Evaluate** — Propose 1-5 candidate actions with value scores (0.0-1.0)
-3. **Select** — Pick the best candidate (set selected_index)
-4. **Act** — The heartbeat tool will instruct you to execute using bash/read/write/edit
+2. **Evaluate** — Propose 1-5 candidate actions with value scores (0.0-1.0). Be honest — propose ALL reasonable options.
+3. **Select** — The POLICY ENGINE selects the action, not you. You do not choose. Propose candidates and the deterministic policy decides.
+4. **Act** — Execute the policy-selected action using the appropriate tool (bash, read, write, edit), then call heartbeat again.
 
-After executing the action with the appropriate tool, call heartbeat again.
+**Important**: You propose and score. The policy engine selects. Do NOT self-censor — if an action is relevant, propose it even if you think policy might block it. The policy engine handles safety.
 
-Keep going until you call heartbeat with action_type "complete" or reach ${state.maxHeartbeats} heartbeats.
+For \`update_memory\`, always include params: \`{ "key": "...", "value": "..." }\`.
+
+Keep going until the policy selects "complete" or you reach ${state.maxHeartbeats} heartbeats.
 
 ## Scoring Guide
 - 1.0 = Critical, do now
