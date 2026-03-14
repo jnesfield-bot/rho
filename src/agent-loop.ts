@@ -238,14 +238,18 @@ export abstract class AgentLoop {
 
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => {
-      const timer = setTimeout(resolve, ms);
+      let resolved = false;
+      const done = () => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(timer);
+        clearInterval(check);
+        resolve();
+      };
+      const timer = setTimeout(done, ms);
       // Allow abort to break sleep
       const check = setInterval(() => {
-        if (this.aborted) {
-          clearTimeout(timer);
-          clearInterval(check);
-          resolve();
-        }
+        if (this.aborted) done();
       }, 100);
     });
   }
